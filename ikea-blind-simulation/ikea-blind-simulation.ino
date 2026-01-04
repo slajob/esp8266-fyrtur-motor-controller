@@ -1,16 +1,14 @@
 #include <SoftwareSerial.h>
 
-// RX = D2 (GPIO4), TX = D1 (GPIO5)
-SoftwareSerial zigbee(4, 5); 
+SoftwareSerial zigbee(4, 5); // RX = D2, TX = D1
 
-// Simulation Variables
+// Simulation State
 uint8_t currentPos = 0;    
 uint8_t targetPos = 0;
-uint8_t motorStatus = 0xEA; // 0xEA = Idle/Stopped
+uint8_t motorStatus = 0xEA; 
 unsigned long lastUpdate = 0;
 
-// Buffer Logic
-uint8_t packetBuffer[12];
+uint8_t packetBuffer[16];
 uint8_t bufIdx = 0;
 uint8_t lastByte = 0;
 
@@ -18,83 +16,78 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   zigbee.begin(2400); 
-  Serial.println("\n--- IKEA Fyrtur Motor Simulator (v2) ---");
-  Serial.println("Waiting for Zigbee Sync (00 FF)...");
+  Serial.println("\n--- IKEA Fyrtur Motor Simulator (v3 - Robust) ---");
 }
 
 void loop() {
   while (zigbee.available()) {
     uint8_t r = zigbee.read();
     
-    // DEBUG: Print raw bytes in a single line for easier reading
-    Serial.print(r < 0x10 ? "0" : "");
-    Serial.print(r, HEX);
-    Serial.print(" ");
-
-    // HEADER SYNC: If we see 00 followed by FF, it's a new packet
+    // Header Sync: Reset on 00 FF
     if (lastByte == 0x00 && r == 0xFF) {
-      packetBuffer[0] = 0x00;
-      packetBuffer[1] = 0xFF;
-      bufIdx = 2;
-    } else if (bufIdx > 0 && bufIdx < 12) {
+      bufIdx = 0;
+      packetBuffer[bufIdx++] = 0x00;
+      packetBuffer[bufIdx++] = 0xFF;
+    } else if (bufIdx > 0 && bufIdx < 16) {
       packetBuffer[bufIdx++] = r;
     }
-    
     lastByte = r;
 
-    // PROCESS PACKETS
+    // Process when we have a likely packet (at least 6 bytes)
     if (bufIdx >= 6) {
-      // 1. HEARTBEAT/POLL (00 FF 9A CC CC 00)
-      if (packetBuffer[2] == 0x9A && packetBuffer[3] == 0xCC) {
-        Serial.println(" -> [POLL]");
-        sendMotorStatus();
-        bufIdx = 0; // Clear buffer after processing
-      } 
-      // 2. MOVE COMMAND (00 FF 9A DD [POS] [CS])
-      // Note: Move commands are usually 6 or 7 bytes
-      else if (bufIdx >= 6 && packetBuffer[2] == 0x9A && packetBuffer[3] == 0xDD) {
-        targetPos = packetBuffer[4];
-        Serial.print(" -> [GOTO ");
-        Serial.print(targetPos);
-        Serial.println("%]");
-        sendMotorStatus();
-        bufIdx = 0;
+      bool processed = false;
+      
+      // Look for Command Byte in the packet
+      for (int i = 2; i < bufIdx; i++) {
+        // HEARTBEAT (CC)
+        if (packetBuffer[i] == 0xCC) {
+          Serial.println(" -> [POLL]");
+          sendMotorStatus();
+          bufIdx = 0; processed = true; break;
+        }
+        // MOVE COMMAND (DD)
+        if (packetBuffer[i] == 0xDD && i + 1 < bufIdx) {
+          targetPos = packetBuffer[i+1];
+          Serial.print(" -> [GOTO "); Serial.print(targetPos); Serial.println("%]");
+          sendMotorStatus();
+          bufIdx = 0; processed = true; break;
+        }
       }
+      // Safety: If buffer gets too long without a command, clear it
+      if (!processed && bufIdx >= 12) bufIdx = 0;
     }
   }
 
-  // SIMULATE MOVEMENT (1% every 800ms)
-  if (millis() - lastUpdate > 800) {
+  // SIMULATION: Movement & "Overcurrent" Stop
+  if (millis() - lastUpdate > 600) { // Moving speed
     if (currentPos != targetPos) {
+      motorStatus = 0xD8; // Moving status
       if (currentPos < targetPos) currentPos++;
       else currentPos--;
-      motorStatus = 0xD8; // Status: Moving
+      
+      Serial.print("Moving... Current: "); Serial.print(currentPos); Serial.println("%");
     } else {
-      motorStatus = 0xEA; // Status: Stopped
+      // We reached the target (or the top 0% limit)
+      motorStatus = 0xEA; // Stopped status (mimics overcurrent stop)
     }
     lastUpdate = millis();
   }
 }
 
 void sendMotorStatus() {
-  // We use 8 bytes as seen in your logs
   uint8_t res[8];
   res[0] = 0x00;
   res[1] = 0xFF;
-  res[2] = 0xD8;       // Motor ID
-  res[3] = 0x49;       // Status Command
+  res[2] = 0xD8;       
+  res[3] = 0x49;       
   res[4] = motorStatus;
   res[5] = currentPos;
   res[6] = targetPos;
   
-  // Custom IKEA Checksum calculation (Sum of payload)
+  // Checksum: Sum of ID through Target Position
   uint16_t sum = 0;
   for (int i = 2; i <= 6; i++) sum += res[i];
-  
-  // Based on your logs, the checksum is likely (0x12E - sum) or similar.
-  // We will use a calculated one, but if it fails, we'll try the 'Inverse Sum'.
   res[7] = (uint8_t)(sum & 0xFF); 
 
-  // Send to Zigbee board
   zigbee.write(res, 8);
 }
